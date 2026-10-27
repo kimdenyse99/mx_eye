@@ -57,6 +57,51 @@ import re
 from bisect import bisect_left
 from pathlib import Path
 
+
+def solve_offset(
+    raw_x: float,
+    raw_y: float,
+    target_x: float,
+    target_y: float,
+    screen_width: float,
+    screen_height: float,
+    gain_x: float,
+    gain_y: float,
+    rotation_deg: float,
+) -> tuple[float, float]:
+    """Solve for the offset_x/offset_y a mx_eye CalibrationProfile would
+    need so that applying its transform (see calibration.py's
+    CalibrationProfile.apply) to (raw_x, raw_y) lands exactly on
+    (target_x, target_y), given the other already-fixed transform
+    parameters (gain, rotation, screen size).
+
+    This mirrors CalibrationProfile.apply's own formula exactly (same
+    center-relative, rotate-then-offset order), just solved in reverse
+    for offset_x/offset_y instead of forward for screen_x/screen_y:
+
+        dx = raw_x * gain_x
+        dy = raw_y * gain_y
+        screen_x = center_x + cos(theta)*dx - sin(theta)*dy + offset_x
+        screen_y = center_y + sin(theta)*dx + cos(theta)*dy + offset_y
+
+    With only one (raw, target) pair, this solves offset_x/offset_y
+    exactly for THIS one point - it says nothing about gain_x/gain_y or
+    rotation_deg themselves, which this function takes as given
+    (whatever is already configured, e.g. 90 degrees for a rotated
+    physical mount) rather than also fitting. Determining gain
+    independently needs at least a second, different known point (see
+    visual_3pt_calibration's three positions).
+    """
+    center_x = screen_width / 2
+    center_y = screen_height / 2
+    dx = raw_x * gain_x
+    dy = raw_y * gain_y
+    theta = math.radians(rotation_deg)
+    cosine, sine = math.cos(theta), math.sin(theta)
+    offset_x = target_x - center_x - (cosine * dx - sine * dy)
+    offset_y = target_y - center_y - (sine * dx + cosine * dy)
+    return offset_x, offset_y
+
 # Must match mx_eye_protocol.data_frame.TrackingFlags.VALID's bit value.
 # Duplicated here (rather than importing mx_eye_protocol) so this script
 # has zero dependency on either the mx_eye or visual_task codebases and
@@ -119,6 +164,26 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--max-skew-ms", type=float, default=200.0)
     parser.add_argument("--require-valid", action="store_true")
+    parser.add_argument(
+        "--screen-width", type=float, default=1024.0,
+        help="Must match the CalibrationProfile's own screen_width (mx-eye default: 1024).",
+    )
+    parser.add_argument(
+        "--screen-height", type=float, default=600.0,
+        help="Must match the CalibrationProfile's own screen_height (mx-eye default: 600).",
+    )
+    parser.add_argument(
+        "--gain-x", type=float, default=1.0,
+        help="This animal's current gain_x from mx-eye's Calibration window (default: 1.0, unset).",
+    )
+    parser.add_argument(
+        "--gain-y", type=float, default=1.0,
+        help="This animal's current gain_y from mx-eye's Calibration window (default: 1.0, unset).",
+    )
+    parser.add_argument(
+        "--rotation-deg", type=float, default=0.0,
+        help="This animal's current rotation_deg from mx-eye's Calibration window (default: 0.0).",
+    )
     args = parser.parse_args()
 
     frame_rows = load_csv(args.frames_csv)
@@ -139,6 +204,7 @@ def main() -> None:
 
     output_rows = []
     skipped_invalid = 0
+    offsets_by_target: dict[tuple[str, str], list[tuple[float, float]]] = {}
     for sidecar in sidecar_rows:
         event_ns = int(sidecar["timestamp_ns"])
 
@@ -156,24 +222,56 @@ def main() -> None:
             skipped_invalid += 1
             continue
 
+        target_x_str = sidecar.get("target_x", "")
+        target_y_str = sidecar.get("target_y", "")
+        raw_x_str = tracking_row.get("x", "")
+        raw_y_str = tracking_row.get("y", "")
+
+        offset_x = offset_y = ""
+        try:
+            offset_x, offset_y = solve_offset(
+                float(raw_x_str),
+                float(raw_y_str),
+                float(target_x_str),
+                float(target_y_str),
+                args.screen_width,
+                args.screen_height,
+                args.gain_x,
+                args.gain_y,
+                args.rotation_deg,
+            )
+            if not (math.isfinite(offset_x) and math.isfinite(offset_y)):
+                offset_x = offset_y = ""
+            else:
+                offsets_by_target.setdefault(
+                    (target_x_str, target_y_str), []
+                ).append((offset_x, offset_y))
+                offset_x, offset_y = round(offset_x, 3), round(offset_y, 3)
+        except (ValueError, TypeError):
+            # target_x/y or raw x/y missing/empty/NaN for this row - leave
+            # offset blank rather than guessing or crashing the whole run.
+            pass
+
         output_rows.append(
             {
                 "trial_id": sidecar["trial_id"],
                 "event": sidecar["event"],
                 "timestamp_ns": event_ns,
-                "target_x": sidecar.get("target_x", ""),
-                "target_y": sidecar.get("target_y", ""),
+                "target_x": target_x_str,
+                "target_y": target_y_str,
                 "video_index": video_index,
                 "video_seconds": video_seconds,
                 "frame_skew_ms": round(frame_skew_ms, 2),
-                "raw_x": tracking_row.get("x", ""),
-                "raw_y": tracking_row.get("y", ""),
+                "raw_x": raw_x_str,
+                "raw_y": raw_y_str,
                 "pupil_x": tracking_row.get("pupil_x", ""),
                 "pupil_y": tracking_row.get("pupil_y", ""),
                 "cr_x": tracking_row.get("cr_x", ""),
                 "cr_y": tracking_row.get("cr_y", ""),
                 "sample_valid": valid,
                 "tracking_skew_ms": round(tracking_skew_ms, 2),
+                "offset_x": offset_x,
+                "offset_y": offset_y,
             }
         )
 
@@ -207,6 +305,8 @@ def main() -> None:
         "cr_y",
         "sample_valid",
         "tracking_skew_ms",
+        "offset_x",
+        "offset_y",
     ]
     with args.output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -216,6 +316,30 @@ def main() -> None:
     print(f"Wrote {len(output_rows)} row(s) to {args.output}")
     if args.require_valid and skipped_invalid:
         print(f"Skipped {skipped_invalid} trial(s) with no valid tracking sample nearby.")
+
+    if offsets_by_target:
+        print(
+            "\nOffset solved per row above assumes gain_x={}, gain_y={}, "
+            "rotation_deg={}, screen {}x{} (pass --gain-x/--gain-y/"
+            "--rotation-deg/--screen-width/--screen-height to match this "
+            "animal's actual CalibrationProfile if different from these "
+            "defaults).".format(
+                args.gain_x,
+                args.gain_y,
+                args.rotation_deg,
+                args.screen_width,
+                args.screen_height,
+            )
+        )
+        print("\nAverage offset_x/offset_y per distinct target position:")
+        for (target_x_str, target_y_str), values in offsets_by_target.items():
+            mean_x = sum(v[0] for v in values) / len(values)
+            mean_y = sum(v[1] for v in values) / len(values)
+            print(
+                f"  target ({target_x_str}, {target_y_str}), "
+                f"{len(values)} trial(s): "
+                f"offset_x={mean_x:.3f}, offset_y={mean_y:.3f}"
+            )
 
 
 if __name__ == "__main__":
