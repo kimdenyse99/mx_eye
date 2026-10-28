@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import re
 from bisect import bisect_left
 from pathlib import Path
 
@@ -60,23 +59,17 @@ def load_frames_csv(path: Path) -> list[dict[str, str]]:
 
 
 def load_trial_sidecars(trial_data_dir: Path, event_name: str) -> list[dict[str, str]]:
-    """Find every trial_<id>_<event_name>.csv in the given directory and
-    return their rows, one dict per matched trial (each sidecar is a
-    one-data-row CSV, per trial_events.py - e.g. event_name="target_shown"
-    or "gaze_correct")."""
-    pattern = re.compile(rf"^trial_(\d+)_{re.escape(event_name)}\.csv$")
-    rows = []
-    for entry in sorted(trial_data_dir.iterdir()):
-        match = pattern.match(entry.name)
-        if not match:
-            continue
-        with entry.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            row = next(reader, None)
-        if row is None:
-            continue
-        rows.append(row)
-    return rows
+    """Read <event_name>.csv from the given directory - one shared file
+    per event type per session/stage, with one row per trial that fired
+    that event (see trial_events.py's _write_trial_event: the filename
+    deliberately excludes trial_id, so every trial in a session
+    accumulates into this one file via DataLogger's own append-mode CSV
+    writing)."""
+    path = trial_data_dir / f"{event_name}.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
 def find_nearest_frame(
@@ -120,7 +113,8 @@ def main() -> None:
     sidecar_rows = load_trial_sidecars(args.trial_data_dir, args.event)
     if not sidecar_rows:
         raise SystemExit(
-            f"No trial_*_{args.event}.csv files found in {args.trial_data_dir}"
+            f"No rows found in {args.trial_data_dir / f'{args.event}.csv'} "
+            f"(file missing or empty)"
         )
 
     output_rows = []
