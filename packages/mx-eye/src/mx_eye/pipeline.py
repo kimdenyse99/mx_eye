@@ -243,7 +243,6 @@ def capture_worker(
             mode_warnings = []
             if failed_requests:
                 mode_warnings.append('Camera did not acknowledge: ' + ', '.join(failed_requests))
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
                 raise RuntimeError("Cannot open camera. Check camera index/backend.")
             try:
@@ -455,12 +454,9 @@ def capture_worker(
                 if ring.put(frame, (fid, acquired, media, acquired_monotonic_ns)):
                     stats["enqueued"].value += 1
                 else:
-                    stats["record_fault"].value = 1
-                    report(
-                        events,
-                        "record_error",
-                        message="Recording buffer overflow. Recording stopped; tracking continues. Session is incomplete.",
-                    )
+                    # Best effort: discard this incoming frame rather than
+                    # stopping acquisition or stretching the saved timeline.
+                    stats["recording_dropped"].value += 1
             index += 1
             if mode is SourceMode.VIDEO:
                 while not stop.is_set() and tracked_frame.value < fid:
@@ -759,6 +755,7 @@ def writer_worker(
     events,
     test_delay=0,
     recording_capture_done=None, recording_generation=0,
+    directory_reserved=False,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     cv2.setNumThreads(1)
@@ -772,7 +769,8 @@ def writer_worker(
     first_monotonic = last_monotonic = None
     frame_file = sample_file = None
     try:
-        folder.mkdir(parents=True, exist_ok=False)
+        if not directory_reserved:
+            folder.mkdir(parents=True, exist_ok=False)
         config.save(folder / "config.json")
         frame_file = (folder / "frames.csv").open("w", newline="", encoding="utf-8")
         sample_file = (folder / "tracking.csv").open("w", newline="", encoding="utf-8")
@@ -812,6 +810,8 @@ def writer_worker(
                 fw.writerow([video_index, fid, acquired, media, acquired_monotonic_ns])
                 video_index += 1
                 stats["written"].value = video_index
+                if "recorded_seconds" in stats:
+                    stats["recorded_seconds"].value = (last_monotonic - first_monotonic) / 1e9
                 if video_index % 60 == 0:
                     frame_file.flush()
                     sample_file.flush()
@@ -871,12 +871,18 @@ def writer_worker(
             session=session,
             acquired=int(stats.get("record_acquired", stats["acquired"]).value),
             written=video_index,
+            recording_dropped=int(stats.get("recording_dropped").value)
+                if "recording_dropped" in stats else 0,
+            recording_policy="best_effort_skip_incoming_when_full",
             tracking_samples=sample_count,
             complete=(
                 not error
                 and not stats["record_fault"].value
                 and not stats["capture_fault"].value
-                and video_index == stats.get("record_acquired", stats["acquired"]).value
+                and video_index == stats["enqueued"].value
+                and video_index + (stats["recording_dropped"].value
+                                  if "recording_dropped" in stats else 0)
+                    == stats.get("record_acquired", stats["acquired"]).value
             ),
             tracking_log_complete=not bool(stats["log_fault"].value),
             recording_fault=int(stats["record_fault"].value),
@@ -887,6 +893,11 @@ def writer_worker(
             timestamp_resolution="MKV timestamps may be quantized by muxer; CSV preserves nanoseconds",
             recorded_span_ns=(last_monotonic - first_monotonic) if last_monotonic is not None else 0,
             camera_driver_drops="not observable through this UVC/OpenCV backend",
+        )
+        summary["all_frames_saved"] = bool(summary["complete"] and not summary["recording_dropped"])
+        summary["recording_result"] = (
+            "failed" if not summary["complete"] or not summary["tracking_log_complete"]
+            else "completed_with_skips" if summary["recording_dropped"] else "completed"
         )
         try:
             (folder / "session.json").write_text(
