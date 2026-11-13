@@ -315,17 +315,20 @@ class Service:
         self.state, self.message = "starting", "Opening source…"
         self.run = run
         source = config.value.source
+        if source.mode is SourceMode.CAMERA:
+            detail = (
+                f"camera={source.camera} {source.width}x{source.height}@{source.fps} "
+                f"{source.fourcc} backend={source.backend.value}"
+            )
+        elif source.mode is SourceMode.VIDEO:
+            detail = f"video={source.path or '-'}"
+        else:
+            detail = f"{source.width}x{source.height}@{source.fps}"
         logger.info(
-            "Session %s starting: source=%s camera=%s %sx%s@%s %s backend=%s video=%s",
+            "Session %s starting: source=%s %s",
             self.session,
             source.mode.value,
-            source.camera,
-            source.width,
-            source.height,
-            source.fps,
-            source.fourcc,
-            source.backend.value,
-            source.path or "-",
+            detail,
         )
         try:
             run["writer_done"].set()
